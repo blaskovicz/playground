@@ -17,41 +17,53 @@ import (
 var log = newStdLogger()
 
 func main() {
-	s, err := newServer(func(s *server) error {
-		pid := projectID()
-		if pid == "" {
-			s.db = &inMemStore{}
-		} else {
-			c, err := datastore.NewClient(context.Background(), pid)
-			if err != nil {
-				return fmt.Errorf("could not create cloud datastore client: %v", err)
+	mode := os.Getenv("playground_mode")
+	if mode == "" {
+		mode = "server"
+	}
+	switch mode {
+	case "server":
+		s, err := newServer(func(s *server) error {
+			pid := projectID()
+			if pid == "" {
+				s.db = &inMemStore{}
+			} else {
+				c, err := datastore.NewClient(context.Background(), pid)
+				if err != nil {
+					return fmt.Errorf("could not create cloud datastore client: %v", err)
+				}
+				s.db = cloudDatastore{client: c}
 			}
-			s.db = cloudDatastore{client: c}
+			if caddr := os.Getenv("MEMCACHED_ADDR"); caddr != "" {
+				s.cache = newGobCache(caddr)
+				log.Printf("App (project ID: %q) is caching results", pid)
+			} else {
+				log.Printf("App (project ID: %q) is NOT caching results", pid)
+			}
+			s.log = log
+			return nil
+		})
+		if err != nil {
+			log.Fatalf("Error creating server: %v", err)
 		}
-		if caddr := os.Getenv("MEMCACHED_ADDR"); caddr != "" {
-			s.cache = newGobCache(caddr)
-			log.Printf("App (project ID: %q) is caching results", pid)
-		} else {
-			log.Printf("App (project ID: %q) is NOT caching results", pid)
+
+		if len(os.Args) > 1 && os.Args[1] == "test" {
+			s.test()
+			return
 		}
-		s.log = log
-		return nil
-	})
-	if err != nil {
-		log.Fatalf("Error creating server: %v", err)
-	}
 
-	if len(os.Args) > 1 && os.Args[1] == "test" {
-		s.test()
-		return
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		log.Printf("Listening on :%v ...", port)
+		log.Fatalf("Error listening on :%v: %v", port, http.ListenAndServe(":"+port, s))
+	case "function":
+		f := newFunction()
+		f.Accept(os.Stdin, os.Stdout, os.Stderr)
+	default:
+		panic(fmt.Errorf("mode %s not implemented", mode))
 	}
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	log.Printf("Listening on :%v ...", port)
-	log.Fatalf("Error listening on :%v: %v", port, http.ListenAndServe(":"+port, s))
 }
 
 func projectID() string {

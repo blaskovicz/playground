@@ -66,7 +66,7 @@ func (s *server) handleCompile(w http.ResponseWriter, r *http.Request) {
 			s.log.Errorf("s.cache.Get(%q, &response): %v", key, err)
 		}
 		var err error
-		resp, err = s.compileAndRun(&req)
+		resp, err = compileAndRun(&req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -198,7 +198,7 @@ func main() {
 }
 `))
 
-func (s *server) compileAndRun(req *request) (*response, error) {
+func compileAndRun(req *request) (*response, error) {
 	// TODO(andybons): Add semaphore to limit number of running programs at once.
 	tmpDir, err := ioutil.TempDir("", "sandbox")
 	if err != nil {
@@ -269,7 +269,7 @@ func (s *server) compileAndRun(req *request) (*response, error) {
 }
 
 func (s *server) healthCheck() error {
-	resp, err := s.compileAndRun(&request{Body: healthProg})
+	resp, err := compileAndRun(&request{Body: healthProg})
 	if err != nil {
 		return err
 	}
@@ -295,7 +295,7 @@ func (s *server) test() {
 		stdlog.Fatal(err)
 	}
 	for _, t := range tests {
-		resp, err := s.compileAndRun(&request{Body: t.prog})
+		resp, err := compileAndRun(&request{Body: t.prog})
 		if err != nil {
 			stdlog.Fatal(err)
 		}

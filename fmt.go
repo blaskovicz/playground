@@ -14,23 +14,25 @@ import (
 	"golang.org/x/tools/imports"
 )
 
+type fmtRequest struct {
+	Imports string
+	Body    string
+}
+
 type fmtResponse struct {
 	Body  string
 	Error string
 }
 
-func handleFmt(w http.ResponseWriter, r *http.Request) {
-	var (
-		in  = []byte(r.FormValue("body"))
-		out []byte
-		err error
-	)
-	if r.FormValue("imports") != "" {
-		out, err = imports.Process(progName, in, nil)
-	} else {
-		out, err = format.Source(in)
-	}
+func fmtter(req *fmtRequest) *fmtResponse {
+	var out []byte
+	var err error
 	var resp fmtResponse
+	if req.Imports != "" {
+		out, err = imports.Process(progName, []byte(req.Body), nil)
+	} else {
+		out, err = format.Source([]byte(req.Body))
+	}
 	if err != nil {
 		resp.Error = err.Error()
 		// Prefix the error returned by format.Source.
@@ -40,5 +42,14 @@ func handleFmt(w http.ResponseWriter, r *http.Request) {
 	} else {
 		resp.Body = string(out)
 	}
+	return &resp
+}
+
+func handleFmt(w http.ResponseWriter, r *http.Request) {
+	req := fmtRequest{
+		Body:    r.FormValue("body"),
+		Imports: r.FormValue("imports"),
+	}
+	resp := fmtter(&req)
 	json.NewEncoder(w).Encode(resp)
 }
