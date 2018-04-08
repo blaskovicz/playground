@@ -1,11 +1,14 @@
-default: docker
+default: build
 
-.PHONY: update-deps docker test
+.PHONY: update-deps docker test build
+
+build:
+	go build
 
 update-deps:
+	go get golang.org/x/build/cmd/gitlock
 	go install golang.org/x/build/cmd/gitlock
-	gitlock --update=Dockerfile golang.org/x/playground
-	gitlock --update=Dockerfile.function golang.org/x/playground
+	gitlock --update=Dockerfile github.com/blaskovicz/playground-golang
 
 docker: Dockerfile
 	docker build -t playground .

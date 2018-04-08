@@ -12,11 +12,15 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/datastore"
+	swarmed "github.com/blaskovicz/go-swarmed"
 )
 
 var log = newStdLogger()
 
 func main() {
+	if err := swarmed.LoadSecretsWithOpts("playground-golang", true); err != nil {
+		log.Fatalf("Error loading secrets: %v", err)
+	}
 	mode := os.Getenv("playground_mode")
 	if mode == "" {
 		mode = "server"
@@ -34,15 +38,15 @@ func main() {
 				}
 				s.db = cloudDatastore{client: c}
 			}
-			if caddr := os.Getenv("MEMCACHED_ADDR"); caddr != "" {
-				s.cache = newGobCache(caddr)
-				log.Printf("App (project ID: %q) is caching results", pid)
-			} else {
-				log.Printf("App (project ID: %q) is NOT caching results", pid)
+			var err error
+			s.cache, err = newGobCacheFromEnv()
+			if err != nil {
+				return fmt.Errorf("could not create cache client: %v", err)
 			}
 			s.log = log
 			return nil
 		})
+
 		if err != nil {
 			log.Fatalf("Error creating server: %v", err)
 		}
@@ -59,7 +63,10 @@ func main() {
 		log.Printf("Listening on :%v ...", port)
 		log.Fatalf("Error listening on :%v: %v", port, http.ListenAndServe(":"+port, s))
 	case "function":
-		f := newFunction()
+		f, err := newFunction()
+		if err != nil {
+			log.Fatalf("Error creating function: %v", err)
+		}
 		f.Accept(os.Stdin, os.Stdout, os.Stderr)
 	default:
 		panic(fmt.Errorf("mode %s not implemented", mode))

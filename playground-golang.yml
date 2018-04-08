@@ -7,3 +7,5 @@ functions:
     lang: Dockerfile
     skip_build: true
     image: 127.0.0.1:5000/playground-golang
+    secrets:
+      - playground-golang_cache_url_v1

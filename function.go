@@ -7,10 +7,18 @@ import (
 )
 
 type functionArgs map[string]interface{}
-type Function struct{}
+type Function struct {
+	cache *gobCache
+}
 
-func newFunction() *Function {
-	return &Function{}
+func newFunction() (*Function, error) {
+	cache, err := newGobCacheFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return &Function{
+		cache: cache,
+	}, nil
 }
 
 func writeFunctionError(err error, out io.Writer) {
@@ -43,9 +51,14 @@ func (f *Function) accept(in io.ReadCloser, out io.WriteCloser, errors io.WriteC
 	body, _ := fa["Body"].(string)
 	switch mode {
 	case "compile":
-		resp, err := compileAndRun(&request{body})
-		if err != nil {
-			return err
+		resp := &response{}
+		key := cacheKey(body)
+		if err := f.cache.Get(key, resp); err != nil {
+			resp, err = compileAndRun(&request{body})
+			if err != nil {
+				return err
+			}
+			f.cache.Set(key, resp)
 		}
 		writeFunctionResponse(resp, out)
 	case "fmt", "format":

@@ -1,3 +1,4 @@
 playground
 *.swp
 /template
+/playground-golang
