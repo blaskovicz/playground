@@ -52,7 +52,7 @@ func (f *Function) accept(in io.ReadCloser, out io.WriteCloser, errors io.WriteC
 	switch mode {
 	case "compile":
 		resp := &response{}
-		key := cacheKey(body)
+		key := cacheKey("prog", body)
 		if err := f.cache.Get(key, resp); err != nil {
 			resp, err = compileAndRun(&request{body})
 			if err != nil {
