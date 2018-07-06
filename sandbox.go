@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/doc"
 	"go/parser"
 	"go/token"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"text/template"
@@ -48,49 +50,58 @@ type response struct {
 	Events []Event
 }
 
-func (s *server) handleCompile(w http.ResponseWriter, r *http.Request) {
-	var req request
-	// Until programs that depend on golang.org/x/tools/godoc/static/playground.js
-	// are updated to always send JSON, this check is in place.
-	if b := r.FormValue("body"); b != "" {
-		req.Body = b
-	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("error decoding request: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	resp := &response{}
-	key := cacheKey(req.Body)
-	if err := s.cache.Get(key, resp); err != nil {
-		if err != memcache.ErrCacheMiss {
-			s.log.Errorf("s.cache.Get(%q, &response): %v", key, err)
-		}
-		var err error
-		resp, err = compileAndRun(&req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+// commandHandler returns an http.HandlerFunc.
+// This handler creates a *request, assigning the "Body" field a value
+// from the "body" form parameter or from the HTTP request body.
+// If there is no cached *response for the combination of cachePrefix and request.Body,
+// handler calls cmdFunc and in case of a nil error, stores the value of *response in the cache.
+func (s *server) commandHandler(cachePrefix string, cmdFunc func(*request) (*response, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req request
+		// Until programs that depend on golang.org/x/tools/godoc/static/playground.js
+		// are updated to always send JSON, this check is in place.
+		if b := r.FormValue("body"); b != "" {
+			req.Body = b
+		} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.log.Errorf("error decoding request: %v", err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		if err := s.cache.Set(key, resp); err != nil {
-			s.log.Errorf("cache.Set(%q, resp): %v", key, err)
-		}
-	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(resp); err != nil {
-		http.Error(w, fmt.Sprintf("error encoding response: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if _, err := io.Copy(w, &buf); err != nil {
-		s.log.Errorf("io.Copy(w, %+v): %v", buf, err)
-		return
+		resp := &response{}
+		key := cacheKey(cachePrefix, req.Body)
+		if err := s.cache.Get(key, resp); err != nil {
+			if err != memcache.ErrCacheMiss {
+				s.log.Errorf("s.cache.Get(%q, &response): %v", key, err)
+			}
+			resp, err = cmdFunc(&req)
+			if err != nil {
+				s.log.Errorf("cmdFunc error: %v", err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if err := s.cache.Set(key, resp); err != nil {
+				s.log.Errorf("cache.Set(%q, resp): %v", key, err)
+			}
+		}
+
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(resp); err != nil {
+			s.log.Errorf("error encoding response: %v", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(w, &buf); err != nil {
+			s.log.Errorf("io.Copy(w, &buf): %v", err)
+			return
+		}
 	}
 }
 
-func cacheKey(body string) string {
+func cacheKey(prefix, body string) string {
 	h := sha256.New()
 	io.WriteString(h, body)
-	return fmt.Sprintf("prog-%s-%x", runtime.Version(), h.Sum(nil))
+	return fmt.Sprintf("%s-%s-%x", prefix, runtime.Version(), h.Sum(nil))
 }
 
 // isTestFunc tells whether fn has the type of a testing function.
@@ -130,29 +141,30 @@ func isTest(name, prefix string) bool {
 	return ast.IsExported(name[len(prefix):])
 }
 
-// getTestMain returns sources with main function which runs all found tests in src.
-// This happens if the main function is not present and there are appropriate test functions.
-// Otherwise it returns nil.
-// Examples are not supported yet. Benchmarks will never be supported because of sandboxing.
-func getTestMain(src []byte) []byte {
+// getTestProg returns source code that executes all valid tests and examples in src.
+// If the main function is present or there are no tests or examples, it returns nil.
+// getTestProg emulates the "go test" command as closely as possible.
+// Benchmarks are not supported because of sandboxing.
+func getTestProg(src []byte) []byte {
 	fset := token.NewFileSet()
 	// Early bail for most cases.
 	f, err := parser.ParseFile(fset, "main.go", src, parser.ImportsOnly)
 	if err != nil || f.Name.Name != "main" {
 		return nil
 	}
-	var testing bool
+
+	// importPos stores the position to inject the "testing" import declaration, if needed.
+	importPos := fset.Position(f.Name.End()).Offset
+
+	var testingImported bool
 	for _, s := range f.Imports {
 		if s.Path.Value == `"testing"` && s.Name == nil {
-			testing = true
+			testingImported = true
 			break
 		}
 	}
-	if !testing {
-		return nil
-	}
 
-	// Parse everything and extract test names
+	// Parse everything and extract test names.
 	f, err = parser.ParseFile(fset, "main.go", src, parser.ParseComments)
 	if err != nil {
 		return nil
@@ -167,7 +179,7 @@ func getTestMain(src []byte) []byte {
 		name := n.Name.Name
 		switch {
 		case name == "main":
-			// main declared a method will not obstruct creation of our main function.
+			// main declared as a method will not obstruct creation of our main function.
 			if n.Recv == nil {
 				return nil
 			}
@@ -176,28 +188,76 @@ func getTestMain(src []byte) []byte {
 		}
 	}
 
-	if len(tests) == 0 {
+	// Tests imply imported "testing" package in the code.
+	// If there is no import, bail to let the compiler produce an error.
+	if !testingImported && len(tests) > 0 {
 		return nil
 	}
+
+	// We emulate "go test". An example with no "Output" comment is compiled,
+	// but not executed. An example with no text after "Output:" is compiled,
+	// executed, and expected to produce no output.
+	var ex []*doc.Example
+	// exNoOutput indicates whether an example with no output is found.
+	// We need to compile the program containing such an example even if there are no
+	// other tests or examples.
+	exNoOutput := false
+	for _, e := range doc.Examples(f) {
+		if e.Output != "" || e.EmptyOutput {
+			ex = append(ex, e)
+		}
+		if e.Output == "" && !e.EmptyOutput {
+			exNoOutput = true
+		}
+	}
+
+	if len(tests) == 0 && len(ex) == 0 && !exNoOutput {
+		return nil
+	}
+
+	if !testingImported && (len(ex) > 0 || exNoOutput) {
+		// In case of the program with examples and no "testing" package imported,
+		// add import after "package main" without modifying line numbers.
+		importDecl := []byte(`;import "testing";`)
+		src = bytes.Join([][]byte{src[:importPos], importDecl, src[importPos:]}, nil)
+	}
+
+	data := struct {
+		Tests    []string
+		Examples []*doc.Example
+	}{
+		tests,
+		ex,
+	}
 	code := new(bytes.Buffer)
-	if err := testTmpl.Execute(code, tests); err != nil {
+	if err := testTmpl.Execute(code, data); err != nil {
 		panic(err)
 	}
-	return code.Bytes()
+	src = append(src, code.Bytes()...)
+	return src
 }
 
 var testTmpl = template.Must(template.New("main").Parse(`
 func main() {
 	matchAll := func(t string, pat string) (bool, error) { return true, nil }
 	tests := []testing.InternalTest{
-{{range .}}
+{{range .Tests}}
 		{"{{.}}", {{.}}},
 {{end}}
 	}
-	testing.Main(matchAll, tests, nil, nil)
+	examples := []testing.InternalExample{
+{{range .Examples}}
+		{"Example{{.Name}}", Example{{.Name}}, {{printf "%q" .Output}}, {{.Unordered}}},
+{{end}}
+	}
+	testing.Main(matchAll, tests, nil, examples)
 }
 `))
 
+// compileAndRun tries to build and run a user program.
+// The output of successfully ran program is returned in *response.Events.
+// If a program cannot be built or has timed out,
+// *response.Errors contains an explanation for a user.
 func compileAndRun(req *request) (*response, error) {
 	// TODO(andybons): Add semaphore to limit number of running programs at once.
 	tmpDir, err := ioutil.TempDir("", "sandbox")
@@ -220,10 +280,9 @@ func compileAndRun(req *request) (*response, error) {
 	}
 
 	var testParam string
-	if code := getTestMain(src); code != nil {
+	if code := getTestProg(src); code != nil {
 		testParam = "-test.v"
-		src = append(src, code...)
-		if err := ioutil.WriteFile(in, src, 0400); err != nil {
+		if err := ioutil.WriteFile(in, code, 0400); err != nil {
 			return nil, fmt.Errorf("error creating temp file %q: %v", in, err)
 		}
 	}
@@ -299,6 +358,12 @@ func (s *server) test() {
 		if err != nil {
 			stdlog.Fatal(err)
 		}
+		if t.wantEvents != nil {
+			if !reflect.DeepEqual(resp.Events, t.wantEvents) {
+				stdlog.Fatalf("resp.Events = %q, want %q", resp.Events, t.wantEvents)
+			}
+			continue
+		}
 		if t.errors != "" {
 			if resp.Errors != t.errors {
 				stdlog.Fatalf("resp.Errors = %q, want %q", resp.Errors, t.errors)
@@ -308,8 +373,15 @@ func (s *server) test() {
 		if resp.Errors != "" {
 			stdlog.Fatal(resp.Errors)
 		}
-		if len(resp.Events) != 1 || !strings.Contains(resp.Events[0].Message, t.want) {
-			stdlog.Fatalf("unexpected output: %v, want %q", resp.Events, t.want)
+		if len(resp.Events) == 0 {
+			stdlog.Fatalf("unexpected output: %q, want %q", "", t.want)
+		}
+		var b strings.Builder
+		for _, e := range resp.Events {
+			b.WriteString(e.Message)
+		}
+		if !strings.Contains(b.String(), t.want) {
+			stdlog.Fatalf("unexpected output: %q, want %q", b.String(), t.want)
 		}
 	}
 	fmt.Println("OK")
@@ -317,6 +389,7 @@ func (s *server) test() {
 
 var tests = []struct {
 	prog, want, errors string
+	wantEvents         []Event
 }{
 	{prog: `
 package main
@@ -463,6 +536,10 @@ package main
 func TestSanity(t *testing.T) {
 	t.Error("uhh...")
 }
+
+func ExampleNotExecuted() {
+	// Output: it should not run
+}
 `, want: "", errors: "prog.go:4:20: undefined: testing\n"},
 
 	{prog: `
@@ -481,4 +558,126 @@ func main() {
 	fmt.Println("test")
 }
 `, want: "test"},
+
+	{prog: `
+package main//comment
+
+import "fmt"
+
+func ExampleOutput() {
+	fmt.Println("The output")
+	// Output: The output
+}
+`, want: `=== RUN   ExampleOutput
+--- PASS: ExampleOutput (0.00s)
+PASS`},
+
+	{prog: `
+package main//comment
+
+import "fmt"
+
+func ExampleUnorderedOutput() {
+	fmt.Println("2")
+	fmt.Println("1")
+	fmt.Println("3")
+	// Unordered output: 3
+	// 2
+	// 1
+}
+`, want: `=== RUN   ExampleUnorderedOutput
+--- PASS: ExampleUnorderedOutput (0.00s)
+PASS`},
+
+	{prog: `
+package main
+
+import "fmt"
+
+func ExampleEmptyOutput() {
+	// Output:
+}
+
+func ExampleEmptyOutputFail() {
+	fmt.Println("1")
+	// Output:
+}
+`, want: `=== RUN   ExampleEmptyOutput
+--- PASS: ExampleEmptyOutput (0.00s)
+=== RUN   ExampleEmptyOutputFail
+--- FAIL: ExampleEmptyOutputFail (0.00s)
+got:
+1
+want:
+
+FAIL`},
+
+	// Run program without executing this example function.
+	{prog: `
+package main
+
+func ExampleNoOutput() {
+	panic(1)
+}
+`, want: `testing: warning: no tests to run
+PASS`},
+
+	{prog: `
+package main
+
+import "fmt"
+
+func ExampleShouldNotRun() {
+	fmt.Println("The output")
+	// Output: The output
+}
+
+func main() {
+	fmt.Println("Main")
+}
+`, want: "Main"},
+
+	{prog: `
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Fprintln(os.Stdout, "A")
+	fmt.Fprintln(os.Stderr, "B")
+	fmt.Fprintln(os.Stdout, "A")
+	fmt.Fprintln(os.Stdout, "A")
+}
+`, want: "A\nB\nA\nA\n"},
+
+	// Integration test for runtime.write fake timestamps.
+	{prog: `
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+)
+
+func main() {
+	fmt.Fprintln(os.Stdout, "A")
+	fmt.Fprintln(os.Stderr, "B")
+	fmt.Fprintln(os.Stdout, "A")
+	fmt.Fprintln(os.Stdout, "A")
+	time.Sleep(time.Second)
+	fmt.Fprintln(os.Stderr, "B")
+	time.Sleep(time.Second)
+	fmt.Fprintln(os.Stdout, "A")
+}
+`, wantEvents: []Event{
+		{"A\n", "stdout", 0},
+		{"B\n", "stderr", time.Nanosecond},
+		{"A\nA\n", "stdout", time.Nanosecond},
+		{"B\n", "stderr", time.Second - 2*time.Nanosecond},
+		{"A\n", "stdout", time.Second},
+	}},
 }
