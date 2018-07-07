@@ -15,7 +15,7 @@ RUN apt-get purge -y --auto-remove curl
 
 # run function watchdog
 ENV playground_mode=function
-ENV fprocess "/go/bin/playground"
+ENV fprocess "/app/playground"
 ENTRYPOINT []
 CMD ["/usr/bin/fwatchdog"]
 
